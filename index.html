@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Private Viewer</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#111318;color:#f3f4f6;font:16px system-ui,sans-serif;min-height:100vh;display:grid;place-items:center;padding:20px}
+main{width:min(100%,460px);background:#1b1e26;border:1px solid #343845;border-radius:18px;padding:24px;box-shadow:0 18px 60px #0005}
+h1{font-size:1.35rem;margin:0 0 8px}p{color:#b9bfcc;line-height:1.55}
+label{display:block;margin:20px 0 8px;font-size:.92rem}input{width:100%;padding:13px;border:1px solid #454b5b;border-radius:10px;background:#101218;color:#fff;font:inherit}
+button{width:100%;margin-top:12px;padding:13px;border:0;border-radius:10px;background:#dbeafe;color:#111827;font:600 1rem system-ui;cursor:pointer}button:disabled{opacity:.55;cursor:wait}
+#status{min-height:1.5em;font-size:.92rem;margin-top:12px;color:#fca5a5}#app{display:none;position:fixed;inset:0;background:#111318}iframe{border:0;width:100%;height:100%;background:#111318}
+.small{font-size:.82rem}
+</style>
+</head>
+<body>
+<main id="gate">
+<h1>プライベート画像ビューワ</h1>
+<p>パスワードを入力してください。</p>
+<form id="unlock">
+<label for="password">パスワード</label>
+<input id="password" type="password" autocomplete="current-password" required autofocus>
+<button id="submit" type="submit">復号して開く</button>
+</form>
+<div id="status" role="status" aria-live="polite"></div>
+<p class="small">このページは復号処理をブラウザ内で行います。パスワードは送信されません。</p>
+</main>
+<div id="app"><iframe id="viewer" title="画像ビューワ" sandbox="allow-scripts"></iframe></div>
+<script>
+"use strict";
+// AES-GCM: encrypted file format = 12-byte random IV || ciphertext+tag.
+// salt.bin is public; it is not a password or a secret.
+const enc = new TextEncoder();
+const normalizePassword = s => s.normalize("NFC");
+let key = null, manifest = null;
+const statusEl = document.getElementById("status");
+function setStatus(s){statusEl.textContent=s}
+async function readBytes(path){
+  const r=await fetch(path,{cache:"no-store"});
+  if(!r.ok) throw new Error("必要なファイルを取得できません: "+path);
+  return new Uint8Array(await r.arrayBuffer());
+}
+async function deriveKey(password,salt){
+  const material=await crypto.subtle.importKey("raw",enc.encode(normalizePassword(password)),"PBKDF2",false,["deriveKey"]);
+  return crypto.subtle.deriveKey({name:"PBKDF2",salt,iterations:600000,hash:"SHA-256"},material,{name:"AES-GCM",length:256},false,["decrypt"]);
+}
+async function decryptBytes(bytes){
+  if(bytes.length<12+16) throw new Error("暗号化ファイルの形式が不正です");
+  const iv=bytes.slice(0,12), ciphertext=bytes.slice(12);
+  return new Uint8Array(await crypto.subtle.decrypt({name:"AES-GCM",iv},key,ciphertext));
+}
+async function decryptText(path){return new TextDecoder().decode(await decryptBytes(await readBytes(path)))}
+document.getElementById("unlock").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const button=document.getElementById("submit");
+  button.disabled=true;setStatus("復号しています…");
+  try{
+    if(!isSecureContext || !crypto.subtle) throw new Error("Web Crypto API が使えません。HTTPS の GitHub Pages で開いてください。");
+    const salt=await readBytes("salt.bin");
+    if(salt.length!==16) throw new Error("salt.bin の形式が不正です");
+    key=await deriveKey(document.getElementById("password").value,salt);
+    // Both metadata and viewer HTML are encrypted.
+    const results=await Promise.all([decryptText("manifest.enc"),decryptText("viewer.enc")]);
+    manifest=JSON.parse(results[0]);
+    if(!manifest || !Array.isArray(manifest.images)) throw new Error("一覧データの形式が不正です");
+    const iframe=document.getElementById("viewer");
+    iframe.srcdoc=results[1];
+    document.getElementById("gate").style.display="none";
+    document.getElementById("app").style.display="block";
+    document.getElementById("password").value="";
+    setStatus("");
+  }catch(err){
+    key=null;manifest=null;
+    setStatus("開けませんでした。パスワード、または暗号化ファイルを確認してください。");
+    console.error(err);
+  }finally{button.disabled=false}
+});
+// The decrypted iframe asks for an image by opaque ID. Verify the sender window.
+window.addEventListener("message",async e=>{
+  const frame=document.getElementById("viewer");
+  if(e.source!==frame.contentWindow || !e.data || e.data.type!=="load-image" || !key || !manifest) return;
+  const item=manifest.images.find(x=>x.id===e.data.id);
+  const kind=e.data.kind==="full"?"full":"preview";
+  if(!item) {frame.contentWindow.postMessage({type:"image-error",id:e.data.id,kind},"*");return;}
+  const file=kind==="full"?item.file:item.previewFile;
+  const mime=kind==="full"?(item.mime||"application/octet-stream"):"image/jpeg";
+  try{
+    const bytes=await decryptBytes(await readBytes("assets/"+file));
+    const buffer=bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    frame.contentWindow.postMessage({type:"image-ready",id:item.id,kind,buffer,mime}, "*", [buffer]);
+  }catch(err){
+    frame.contentWindow.postMessage({type:"image-error",id:item.id,kind},"*");
+    console.error(err);
+  }
+});
+</script>
+</body>
+</html>
